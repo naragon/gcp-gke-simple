@@ -1,0 +1,6 @@
+project_id = "your-gcp-project" # Replace with the PROJECT_ID used during bootstrap.
+region     = "us-central1"
+zone       = "us-central1-a"
+admin_cidr = "203.0.113.10/32" # Replace with your public IP.
+# node_machine_type = "e2-medium"
+# deletion_protection = false # Apply first, then destroy.

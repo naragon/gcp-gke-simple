@@ -1,0 +1,239 @@
+---
+- name: Deploy Hello world and cert-manager
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - vars.yml
+  vars:
+    repo_root: "{{ playbook_dir }}/.."
+    image_tag: "src-{{ (lookup('file', repo_root + '/app/Dockerfile') + lookup('file', repo_root + '/app/go.mod') + lookup('file', repo_root + '/app/main.go') + lookup('file', repo_root + '/app/main_test.go')) | hash('sha256') }}"
+  tasks:
+    - name: Validate deployment options
+      ansible.builtin.assert:
+        that:
+          - not ansible_check_mode
+          - acme_environment in ['staging', 'production']
+        fail_msg: This build/deploy playbook requires a real run; use staging or production.
+
+    - name: Read Terraform outputs without duplicating configuration
+      ansible.builtin.command:
+        argv: [terraform, "-chdir={{ repo_root }}/terraform/infra", output, -json, deployment]
+      register: terraform_output
+      changed_when: false
+
+    - name: Set infrastructure configuration
+      ansible.builtin.set_fact:
+        infra: "{{ terraform_output.stdout | from_json }}"
+
+    - name: Fetch credentials into the isolated kubeconfig
+      ansible.builtin.command:
+        argv: [gcloud, container, clusters, get-credentials, "{{ infra.cluster_name }}", "--zone={{ infra.zone }}", "--project={{ infra.project_id }}"]
+      changed_when: false
+
+    - name: Require successful staging issuance before promotion
+      when: acme_environment == 'production'
+      block:
+        - name: Inspect staging certificate
+          kubernetes.core.k8s_info:
+            api_version: cert-manager.io/v1
+            kind: Certificate
+            namespace: "{{ app_namespace }}"
+            name: hello-staging
+          register: staging
+        - name: Guard production issuance
+          ansible.builtin.assert:
+            that:
+              - staging.resources | length == 1
+              - hostname in staging.resources[0].spec.dnsNames
+              - "staging.resources[0].status.conditions | default([]) | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length == 1"
+            fail_msg: First complete staging issuance and verify the endpoint.
+
+    - name: Check whether the immutable source image already exists
+      ansible.builtin.command:
+        argv: [gcloud, artifacts, docker, images, describe, "{{ infra.image_name }}:{{ image_tag }}", "--project={{ infra.project_id }}", "--format=value(image_summary.digest)"]
+      register: existing_image
+      changed_when: false
+      failed_when: existing_image.rc != 0 and 'NOT_FOUND' not in existing_image.stderr and 'Image not found.' not in existing_image.stderr
+
+    - name: Build and push with temporary, short-lived authentication
+      when: existing_image.rc != 0
+      block:
+        - name: Create private temporary Docker configuration
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: gke-lab-docker-
+          register: docker_config
+        - name: Obtain short-lived access token (never a service-account key)
+          ansible.builtin.command:
+            argv: [gcloud, auth, print-access-token]
+          register: access_token
+          changed_when: false
+          no_log: true
+        - name: Authenticate Docker
+          ansible.builtin.command:
+            argv: [docker, login, -u, oauth2accesstoken, --password-stdin, "{{ infra.registry_host }}"]
+            stdin: "{{ access_token.stdout }}"
+          environment:
+            DOCKER_CONFIG: "{{ docker_config.path }}"
+          no_log: true
+          changed_when: false
+        - name: Build tested amd64 image
+          ansible.builtin.command:
+            argv: [docker, build, --platform=linux/amd64, -t, "{{ infra.image_name }}:{{ image_tag }}", "{{ repo_root }}/app"]
+          changed_when: true
+        - name: Push private image
+          ansible.builtin.command:
+            argv: [docker, push, "{{ infra.image_name }}:{{ image_tag }}"]
+          environment:
+            DOCKER_CONFIG: "{{ docker_config.path }}"
+          changed_when: true
+      always:
+        - name: Delete temporary Docker credentials
+          ansible.builtin.file:
+            path: "{{ docker_config.path }}"
+            state: absent
+          when: docker_config is defined and docker_config.path is defined
+          no_log: true
+
+    - name: Resolve immutable image digest
+      ansible.builtin.command:
+        argv: [gcloud, artifacts, docker, images, describe, "{{ infra.image_name }}:{{ image_tag }}", "--project={{ infra.project_id }}", "--format=value(image_summary.digest)"]
+      register: image_digest
+      changed_when: false
+
+    - name: Validate digest
+      ansible.builtin.assert:
+        that: image_digest.stdout is match('^sha256:[a-f0-9]{64}$')
+
+    - name: Create namespaces
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ item }}"
+            labels:
+              pod-security.kubernetes.io/enforce: "{{ 'baseline' if item == app_namespace else 'restricted' }}"
+              pod-security.kubernetes.io/audit: restricted
+              pod-security.kubernetes.io/warn: restricted
+      loop: ["{{ app_namespace }}", cert-manager, ingress-system]
+      # ACME solver pods are baseline-compatible; the app itself is restricted-compatible.
+
+    - name: Add pinned chart repositories
+      kubernetes.core.helm_repository:
+        name: "{{ item.name }}"
+        repo_url: "{{ item.url }}"
+      loop:
+        - {name: jetstack, url: 'https://charts.jetstack.io'}
+        - {name: traefik, url: 'https://traefik.github.io/charts'}
+
+    - name: Install cert-manager in its own namespace
+      kubernetes.core.helm:
+        name: cert-manager
+        chart_ref: jetstack/cert-manager
+        chart_version: "{{ cert_manager_chart_version }}"
+        release_namespace: cert-manager
+        update_repo_cache: true
+        wait: true
+        timeout: 10m0s
+        release_values:
+          crds:
+            enabled: true
+            keep: true
+          prometheus:
+            enabled: false
+          strategy:
+            type: RollingUpdate
+            rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+          resources:
+            requests: {cpu: 20m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          webhook:
+            strategy:
+              type: RollingUpdate
+              rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+            resources:
+              requests: {cpu: 10m, memory: 32Mi}
+              limits: {memory: 128Mi}
+          cainjector:
+            strategy:
+              type: RollingUpdate
+              rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+            resources:
+              requests: {cpu: 10m, memory: 64Mi}
+              limits: {memory: 256Mi}
+
+    - name: Install Traefik (no dashboard or built-in ACME)
+      kubernetes.core.helm:
+        name: traefik
+        chart_ref: traefik/traefik
+        chart_version: "{{ traefik_chart_version }}"
+        release_namespace: ingress-system
+        update_repo_cache: true
+        wait: true
+        timeout: 10m0s
+        release_values:
+          deployment:
+            replicas: 2
+          updateStrategy:
+            type: RollingUpdate
+            rollingUpdate:
+              maxSurge: 0
+              maxUnavailable: 1
+          ingressClass:
+            name: traefik
+            isDefaultClass: false
+          api:
+            dashboard: false
+          ingressRoute:
+            dashboard:
+              enabled: false
+          providers:
+            kubernetesIngress:
+              ingressClass: traefik
+              namespaces: ["{{ app_namespace }}"]
+            kubernetesCRD:
+              namespaces: ["{{ app_namespace }}"]
+              allowCrossNamespace: false
+          service:
+            annotations:
+              cloud.google.com/l4-rbs: enabled
+              networking.gke.io/load-balancer-ip-addresses: "{{ infra.ingress_ip_name }}"
+            spec:
+              type: LoadBalancer
+              externalTrafficPolicy: Cluster
+          resources:
+            requests: {cpu: 20m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          topologySpreadConstraints:
+            - maxSkew: 1
+              topologyKey: kubernetes.io/hostname
+              whenUnsatisfiable: ScheduleAnyway
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: traefik
+
+    - name: Apply app, network policy, issuers and certificate
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ lookup('template', 'templates/app.yml.j2') | from_yaml_all | list }}"
+
+    - name: Wait for application rollout
+      ansible.builtin.command:
+        argv: [kubectl, -n, "{{ app_namespace }}", rollout, status, deployment/hello, --timeout=300s]
+      changed_when: false
+
+    - name: Wait for certificate issuance after DNS is configured
+      when: wait_for_certificate | bool
+      ansible.builtin.command:
+        argv: [kubectl, -n, "{{ app_namespace }}", wait, "certificate/hello-{{ acme_environment }}", --for=condition=Ready, --timeout=600s]
+      changed_when: false
+
+    - name: Show DNS and certificate follow-up
+      ansible.builtin.debug:
+        msg:
+          - "Set a DNS-only A record: {{ hostname }} -> {{ infra.ingress_ip }}. Remove conflicting AAAA records."
+          - "Certificate environment: {{ acme_environment }}. Staging certificates are intentionally not browser-trusted."
+          - "After DNS resolves: scripts/deploy.sh -e wait_for_certificate=true"
+          - "After staging succeeds: scripts/deploy.sh -e acme_environment=production -e wait_for_certificate=true"

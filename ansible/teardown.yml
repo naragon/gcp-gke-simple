@@ -1,0 +1,46 @@
+---
+- name: Remove workloads before destroying GCP infrastructure
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - vars.yml
+  tasks:
+    - name: Read Terraform configuration
+      ansible.builtin.command:
+        argv: [terraform, "-chdir={{ playbook_dir }}/../terraform/infra", output, -json, deployment]
+      register: terraform_output
+      changed_when: false
+    - name: Set infrastructure configuration
+      ansible.builtin.set_fact:
+        infra: "{{ terraform_output.stdout | from_json }}"
+    - name: Fetch credentials into isolated kubeconfig
+      ansible.builtin.command:
+        argv: [gcloud, container, clusters, get-credentials, "{{ infra.cluster_name }}", "--zone={{ infra.zone }}", "--project={{ infra.project_id }}"]
+      changed_when: false
+    - name: Remove app while certificate controller is still running
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Namespace
+        name: "{{ app_namespace }}"
+        state: absent
+        wait: true
+        wait_timeout: 600
+    - name: Uninstall ingress (wait for load balancer deletion) and cert-manager
+      kubernetes.core.helm:
+        name: "{{ item.name }}"
+        release_namespace: "{{ item.namespace }}"
+        release_state: absent
+        wait: true
+        timeout: 10m0s
+      loop:
+        - {name: traefik, namespace: ingress-system}
+        - {name: cert-manager, namespace: cert-manager}
+    - name: Remove component namespaces
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Namespace
+        name: "{{ item }}"
+        state: absent
+        wait: true
+        wait_timeout: 600
+      loop: [ingress-system, cert-manager]

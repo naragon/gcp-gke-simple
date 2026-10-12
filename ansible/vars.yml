@@ -1,0 +1,8 @@
+# Override these reserved examples in the ignored .local/deployment.yml file.
+hostname: lab.example.com
+acme_email: admin@example.com
+app_namespace: hello
+acme_environment: staging
+wait_for_certificate: false
+cert_manager_chart_version: v1.21.2
+traefik_chart_version: 41.7.1
